@@ -1,3 +1,7 @@
+# KakaoTalk MCP (read-only fork)
+
+> Fork of [kronenz/kakaotalk-mcp](https://github.com/kronenz/kakaotalk-mcp) (MIT). **Read-only by default**: MCP send tools are disabled and all send functions are blocked unless `KAKAO_ALLOW_SEND=1` is set for a single approved message via `kakao_ro.py send`. Adds chat-list OCR, clipboard/focus restore, new-message state, robust room open, and the `kakao_ro.py` CLI. Unofficial and not affiliated with Kakao; use at your own risk (see Kakao's operating policy).
+
 # KakaoTalk MCP Server
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
