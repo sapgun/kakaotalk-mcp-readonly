@@ -8,6 +8,7 @@ from mcp.server.fastmcp import FastMCP
 from kakao_mcp import controller
 from kakao_mcp import parser
 from kakao_mcp import config
+from kakao_mcp import ro_api
 
 app = FastMCP(
     "kakao-mcp-server",
@@ -52,24 +53,43 @@ def kakao_list_open_rooms() -> Dict:
 
 @app.tool()
 def kakao_open_room(room_name: str) -> Dict:
-    """Open or bring to front a KakaoTalk chat room by name.
-    If the chat window is already open, brings it to foreground.
-    If not, searches for the room in KakaoTalk's search bar.
+    """Open a KakaoTalk chat room by name (tolerant of long names and emoji).
+    Tries exact, emoji-stripped and prefix searches and verifies the opened
+    window title; a wrongly opened room is closed again. Focus is returned to
+    the previously active window.
 
     Args:
         room_name: The name of the chat room or person to open.
     """
     try:
-        hwnd = controller.find_chat_window(room_name)
-        if hwnd:
-            controller.bring_window_to_front(hwnd)
-            return {"message": f"Chat room '{room_name}' brought to foreground", "hwnd": hwnd}
-        result = controller.search_and_open_room(room_name)
-        if result["success"]:
-            return {"message": result["message"], "hwnd": result.get("hwnd")}
-        return {"error": result["error"]}
+        r = ro_api.open_room(room_name, restore_focus=True)
+        return r
     except Exception as e:
         return {"error": f"Failed to open room '{room_name}': {e}"}
+
+
+@app.tool()
+def kakao_list_chat_rooms(enlarge_window: bool = True) -> Dict:
+    """List chat rooms shown in the KakaoTalk main window chat list
+    (name, member_count, preview, time, unread). Uses screen capture + Windows
+    OCR, so text may contain misread characters. The main window may be
+    briefly enlarged to show more rooms and is restored afterwards."""
+    try:
+        return ro_api.list_rooms(enlarge=enlarge_window)
+    except Exception as e:
+        return {"error": f"Failed to list chat rooms: {e}"}
+
+
+@app.tool()
+def kakao_read_new_messages(room_name: str, first_run_limit: int = 20, close_after: bool = False) -> Dict:
+    """Return only messages not returned before for this room (state kept in
+    %LOCALAPPDATA%\\kakao-mcp-readonly\\state.json). First call returns the
+    last `first_run_limit` messages and marks everything as seen. Opens the
+    room if needed; close_after closes it only if this call opened it."""
+    try:
+        return ro_api.read_new(room_name, first_run_limit, close_after)
+    except Exception as e:
+        return {"error": f"Failed to read new messages: {e}"}
 
 
 # @app.tool()  # disabled: read-only
@@ -151,29 +171,20 @@ def kakao_send_image(room_name: str, image_paths: list[str]) -> Dict:
 
 
 @app.tool()
-def kakao_read_messages(room_name: str, max_messages: int = 50) -> Dict:
-    """Read recent messages from a KakaoTalk chat room.
-    Uses clipboard-based reading (Ctrl+A, Ctrl+C on the chat list).
-    NOTE: This briefly brings the chat window to the foreground.
+def kakao_read_messages(room_name: str, max_messages: int = 50, close_after: bool = False) -> Dict:
+    """Read recent messages from a KakaoTalk chat room (Ctrl+A/Ctrl+C on the
+    message list). Opens the room if no window is open. The clipboard and the
+    previously focused window are restored afterwards.
 
     Args:
-        room_name: Exact title of the chat room window.
+        room_name: Chat room title (emoji/spacing differences tolerated).
         max_messages: Maximum number of recent messages to return (default 50).
+        close_after: Close the room window afterwards, only if this call opened it.
     """
     try:
-        result = controller.read_chat_messages(room_name)
-        if not result["success"]:
-            return {"error": result["error"]}
-        parsed = parser.parse_chat_text(result["raw_text"])
-        messages = parsed["messages"]
-        if len(messages) > max_messages:
-            messages = messages[-max_messages:]
-        return {
-            "message": f"Read {len(messages)} messages from '{room_name}'",
-            "room_name": parsed["room_name"],
-            "member_count": parsed["member_count"],
-            "messages": messages,
-        }
+        r = ro_api.read(room_name, max_messages, close_after)
+        r.pop("_all", None)
+        return r
     except Exception as e:
         return {"error": f"Failed to read messages: {e}"}
 

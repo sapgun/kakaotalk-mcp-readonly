@@ -201,3 +201,19 @@ kakaotalk-mcp/
 ## 라이선스
 
 [MIT License](LICENSE)
+
+## Read-only fork additions
+
+Send tools are not registered and controller send functions raise unless `KAKAO_ALLOW_SEND=1`.
+
+CLI (JSON output):
+
+    uv run --quiet python kakao_ro.py list-rooms      # main-window chat list via Windows OCR (best effort)
+    uv run --quiet python kakao_ro.py read "<room>" -n 30 [--close]
+    uv run --quiet python kakao_ro.py read-new "<room>" [--first 20] [--close]
+    uv run --quiet python kakao_ro.py open "<room>"
+    uv run --quiet python kakao_ro.py open-windows
+    uv run --quiet python kakao_ro.py reset-state ["<room>"]
+
+Reads restore the clipboard and the previously focused window. Seen-message state:
+`%LOCALAPPDATA%\kakao-mcp-readonly\state.json`.

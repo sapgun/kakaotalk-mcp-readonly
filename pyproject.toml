@@ -19,7 +19,16 @@ classifiers = [
 ]
 dependencies = [
     "mcp[cli]>=1.3.0,<2",
+    "numpy>=2.2.6",
     "pywin32>=306",
+    "winrt-runtime>=3.2.1",
+    "winrt-windows-foundation>=3.2.1",
+    "winrt-windows-foundation-collections>=3.2.1",
+    "winrt-windows-globalization>=3.2.1",
+    "winrt-windows-graphics-imaging>=3.2.1",
+    "winrt-windows-media-ocr>=3.2.1",
+    "winrt-windows-storage>=3.2.1",
+    "winrt-windows-storage-streams>=3.2.1",
 ]
 
 [project.urls]

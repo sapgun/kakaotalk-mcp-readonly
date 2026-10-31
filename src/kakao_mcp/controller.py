@@ -18,6 +18,11 @@ import win32process
 
 from . import config
 
+try:  # consistent physical-pixel coordinates (needed for screen capture)
+    ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+except Exception:
+    pass
+
 
 def _log(msg: str):
     """Write debug message to stderr (visible in MCP server logs)."""
@@ -215,6 +220,7 @@ def send_message_to_room(room_name: str, text: str) -> Dict:
     Returns:
         Dict with success (bool) and message or error.
     """
+    _require_send_allowed()
     hwnd = find_chat_window(room_name)
     if hwnd is None:
         return {"success": False, "error": f"Chat window '{room_name}' not found"}
@@ -273,6 +279,7 @@ def send_bulk_messages(room_names: List[str], message: str, interval_sec: float 
     Returns:
         Dict with overall result and per-room details.
     """
+    _require_send_allowed()
     if not room_names:
         return {"success": False, "error": "No room names provided"}
     if not message.strip():
@@ -334,6 +341,7 @@ def _copy_image_to_clipboard(file_path: str):
          so no OleFlushClipboard() is needed.
       3. Windows auto-synthesizes CF_BITMAP and CF_DIBV5 from CF_DIB.
     """
+    _require_send_allowed()
     abs_path = os.path.abspath(file_path)
     if not os.path.isfile(abs_path):
         raise FileNotFoundError(f"File not found: {abs_path}")
@@ -381,6 +389,7 @@ def send_image_to_room(room_name: str, image_path: str) -> Dict:
     Ctrl+V into the chat window, and confirms the send dialog.
     NOTE: This briefly brings the chat window to the foreground.
     """
+    _require_send_allowed()
     abs_path = os.path.abspath(image_path)
     if not os.path.isfile(abs_path):
         return {"success": False, "error": f"Image file not found: {abs_path}"}
@@ -453,6 +462,7 @@ def send_image_to_room(room_name: str, image_path: str) -> Dict:
 
 def send_images_to_room(room_name: str, image_paths: List[str]) -> Dict:
     """Send multiple image files to a KakaoTalk chat room, one at a time."""
+    _require_send_allowed()
     if not image_paths:
         return {"success": False, "error": "No image paths provided"}
 
@@ -479,55 +489,176 @@ def send_images_to_room(room_name: str, image_paths: List[str]) -> Dict:
 # Message reading
 # ---------------------------------------------------------------------------
 
-def read_chat_messages(room_name: str) -> Dict:
-    """Read messages from a KakaoTalk chat room via Ctrl+A → Ctrl+C.
+def _require_send_allowed():
+    """Read-only fork: every send path is blocked unless KAKAO_ALLOW_SEND=1."""
+    if os.environ.get("KAKAO_ALLOW_SEND") != "1":
+        raise PermissionError("Sending is disabled in this read-only build (set KAKAO_ALLOW_SEND=1 to override)")
 
-    NOTE: This briefly brings the chat window to the foreground.
 
-    Returns:
-        Dict with success (bool), raw_text (str), and error if failed.
+# Formats we can safely round-trip as raw bytes/str. Handle-based formats
+# (CF_BITMAP, metafiles, palettes, HDROP) are skipped; Windows synthesizes
+# CF_BITMAP/CF_DIBV5/CF_TEXT from CF_DIB/CF_UNICODETEXT.
+_CLIP_SKIP = {2, 3, 9, 14, 15, 16, 17, 0x0080, 0x0081, 0x0082, 0x0083, 0x008E, 1, 7}
+
+
+def _open_clipboard(retries: int = 10) -> bool:
+    for _ in range(retries):
+        try:
+            win32clipboard.OpenClipboard()
+            return True
+        except Exception:
+            time.sleep(0.05)
+    return False
+
+
+def save_clipboard() -> Optional[List[tuple]]:
+    """Snapshot clipboard contents (all byte/str formats)."""
+    if not _open_clipboard():
+        return None
+    saved: List[tuple] = []
+    try:
+        fmt = 0
+        while True:
+            fmt = win32clipboard.EnumClipboardFormats(fmt)
+            if not fmt:
+                break
+            if fmt in _CLIP_SKIP:
+                continue
+            try:
+                saved.append((fmt, win32clipboard.GetClipboardData(fmt)))
+            except Exception:
+                pass
+    finally:
+        win32clipboard.CloseClipboard()
+    return saved
+
+
+def restore_clipboard(saved: Optional[List[tuple]]):
+    if saved is None or not _open_clipboard():
+        return
+    try:
+        win32clipboard.EmptyClipboard()
+        for fmt, data in saved:
+            try:
+                if fmt == win32clipboard.CF_UNICODETEXT:
+                    win32clipboard.SetClipboardText(data, fmt)
+                elif isinstance(data, (bytes, bytearray)):
+                    win32clipboard.SetClipboardData(fmt, bytes(data))
+            except Exception:
+                pass
+    finally:
+        win32clipboard.CloseClipboard()
+
+
+def get_foreground() -> int:
+    return _user32.GetForegroundWindow()
+
+
+def restore_foreground(hwnd: int):
+    """Give focus back to the window the user was using (no resize/restore)."""
+    if not hwnd or not _user32.IsWindow(hwnd) or _user32.GetForegroundWindow() == hwnd:
+        return
+    VK_MENU = 0x12
+    _user32.keybd_event(VK_MENU, 0, 0, 0)
+    _user32.keybd_event(VK_MENU, 0, config.KEYEVENTF_KEYUP, 0)
+    _user32.SetForegroundWindow(hwnd)
+
+
+def close_chat_window(hwnd: int):
+    WM_CLOSE = 0x0010
+    if hwnd and _user32.IsWindow(hwnd) and hwnd != win32gui.FindWindow(
+        config.KAKAO_MAIN_WINDOW_CLASS, config.KAKAO_MAIN_WINDOW_TITLE
+    ):
+        win32gui.PostMessage(hwnd, WM_CLOSE, 0, 0)
+
+
+def read_chat_messages(room_name: str, restore_focus: bool = True,
+                       open_if_needed: bool = False, close_after: bool = False) -> Dict:
+    """Read messages from a KakaoTalk chat room via Ctrl+A -> Ctrl+C.
+
+    The clipboard and the previously focused window are restored afterwards.
+    If open_if_needed, the room is opened via search when no window exists;
+    close_after closes the window only if this call opened it.
     """
+    prev_fg = get_foreground()
+    opened_here = False
     hwnd = find_chat_window(room_name)
+    if hwnd is None:
+        hwnd = find_chat_window_fuzzy(room_name)
+    if hwnd is None and open_if_needed:
+        res = search_and_open_room(room_name, restore_focus=False)
+        if not res.get("success"):
+            if restore_focus:
+                restore_foreground(prev_fg)
+            return {"success": False, "error": res.get("error"), "raw_text": ""}
+        hwnd = res["hwnd"]
+        opened_here = True
     if hwnd is None:
         return {"success": False, "error": f"Chat window '{room_name}' not found", "raw_text": ""}
 
     list_hwnd = find_child_window_recursive(hwnd, config.KAKAO_LIST_CONTROL_CLASS)
     if list_hwnd is None:
-        return {
-            "success": False,
-            "error": f"List control not found in '{room_name}'",
-            "raw_text": "",
-        }
+        return {"success": False, "error": f"List control not found in '{room_name}'", "raw_text": ""}
 
-    # Bring the chat window to foreground — required for keybd_event
-    bring_window_to_front(hwnd)
-    time.sleep(config.WINDOW_ACTIVATE_WAIT_SEC)
-
-    # Click on the list control to ensure it has focus
+    saved_clip = save_clipboard()
+    raw_text = ""
     try:
-        rect = win32gui.GetWindowRect(list_hwnd)
-        cx = (rect[0] + rect[2]) // 2
-        cy = (rect[1] + rect[3]) // 2
-        _user32.SetCursorPos(cx, cy)
-        _user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
-        _user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
-        time.sleep(config.EDIT_CLICK_WAIT_SEC)
-    except Exception:
-        pass
+        bring_window_to_front(hwnd)
+        time.sleep(config.WINDOW_ACTIVATE_WAIT_SEC)
+        if _user32.GetForegroundWindow() != hwnd:
+            return {"success": False, "error": "Could not focus chat window (aborted to avoid stray keystrokes)", "raw_text": ""}
+        # Focus the message list without clicking (a click could hit a link/photo)
+        focused = False
+        try:
+            kernel32 = ctypes.windll.kernel32
+            my_tid = kernel32.GetCurrentThreadId()
+            target_tid = _user32.GetWindowThreadProcessId(hwnd, None)
+            _user32.AttachThreadInput(my_tid, target_tid, True)
+            _user32.SetFocus(list_hwnd)
+            focused = _user32.GetFocus() == list_hwnd
+            _user32.AttachThreadInput(my_tid, target_tid, False)
+            time.sleep(config.EDIT_CLICK_WAIT_SEC)
+        except Exception:
+            pass
+        def _copy_all() -> str:
+            if _open_clipboard():
+                win32clipboard.EmptyClipboard()
+                win32clipboard.CloseClipboard()
+            if _user32.GetForegroundWindow() != hwnd:
+                return ""
+            _send_ctrl_key_combo(config.VK_A)
+            time.sleep(config.KEY_COMBO_WAIT_SEC)
+            _send_ctrl_key_combo(config.VK_C)
+            time.sleep(config.KEY_COMBO_WAIT_SEC)
+            return _read_clipboard_text()
 
-    # Ctrl+A (select all)
-    _send_ctrl_key_combo(config.VK_A)
-    time.sleep(config.KEY_COMBO_WAIT_SEC)
+        raw_text = _copy_all() if focused else ""
+        if not raw_text.strip():
+            # fallback: click the message list (as upstream does), cursor restored
+            try:
+                rect = win32gui.GetWindowRect(list_hwnd)
+                cx = (rect[0] + rect[2]) // 2
+                cy = (rect[1] + rect[3]) // 2
+                old_pos = win32api.GetCursorPos()
+                _user32.SetCursorPos(cx, cy)
+                _user32.mouse_event(0x0002, 0, 0, 0, 0)
+                _user32.mouse_event(0x0004, 0, 0, 0, 0)
+                time.sleep(config.EDIT_CLICK_WAIT_SEC)
+                _user32.SetCursorPos(*old_pos)
+            except Exception:
+                pass
+            raw_text = _copy_all()
+    finally:
+        title = win32gui.GetWindowText(hwnd) if _user32.IsWindow(hwnd) else room_name
+        restore_clipboard(saved_clip)
+        if close_after and opened_here:
+            close_chat_window(hwnd)
+            time.sleep(0.2)
+        if restore_focus:
+            restore_foreground(prev_fg)
 
-    # Ctrl+C (copy)
-    _send_ctrl_key_combo(config.VK_C)
-    time.sleep(config.KEY_COMBO_WAIT_SEC)
-
-    # Read clipboard
-    raw_text = _read_clipboard_text()
-
-    return {"success": True, "raw_text": raw_text}
-
+    return {"success": True, "raw_text": raw_text, "window_title": title,
+            "opened_here": opened_here, "closed": bool(close_after and opened_here)}
 
 # ---------------------------------------------------------------------------
 # Room search/open
@@ -617,79 +748,114 @@ def _ensure_foreground(hwnd: int) -> bool:
     return fg == hwnd
 
 
-def search_and_open_room(room_name: str) -> Dict:
-    """Search for a chat room in KakaoTalk main window and open it.
+def _norm_title(s: str) -> str:
+    """Normalize a room title for comparison: drop emoji/symbols/spaces."""
+    out = []
+    for ch in s:
+        if ord(ch) > 0xFFFF or ch.isspace() or ch in "\u200d\ufe0f":
+            continue
+        if ch.isalnum() or ch in ",":
+            out.append(ch.lower())
+    return "".join(out)
 
-    Uses clipboard paste into the search Edit box (for Korean IME support),
-    then double-clicks the first search result in SearchListCtrl.
 
-    Returns:
-        Dict with success (bool) and message or error.
+def _titles_match(want: str, title: str) -> bool:
+    a, b = _norm_title(want), _norm_title(title)
+    if not a or not b:
+        return False
+    return a == b or a.startswith(b) or b.startswith(a)
+
+
+def find_chat_window_fuzzy(room_name: str) -> Optional[int]:
+    for w in list_chat_windows():
+        if _titles_match(room_name, w["title"]):
+            return w["hwnd"]
+    return None
+
+
+def _search_queries(room_name: str) -> List[str]:
+    """Search strings to try: exact, BMP-only (no emoji), first segment, prefix."""
+    qs: List[str] = []
+    def add(q):
+        q = q.strip()
+        if q and q not in qs:
+            qs.append(q)
+    add(room_name)
+    bmp_only = "".join(ch for ch in room_name if ord(ch) <= 0xFFFF and ch not in "\u200d\ufe0f")
+    add(bmp_only)
+    add(bmp_only[:12])
+    if "," in bmp_only:
+        add(bmp_only.split(",")[0])
+    return qs
+
+
+def search_and_open_room(room_name: str, restore_focus: bool = True) -> Dict:
+    """Search for a chat room in the KakaoTalk main window and open it.
+
+    Tries several search strings (exact, emoji-stripped, prefixes). After each
+    attempt the newly opened window title is verified against room_name; a
+    window that does not match is closed again. Keystrokes are only sent while
+    the KakaoTalk main window is verified to be in the foreground.
     """
-    main_hwnd = win32gui.FindWindow(
-        config.KAKAO_MAIN_WINDOW_CLASS, config.KAKAO_MAIN_WINDOW_TITLE
-    )
+    existing = find_chat_window(room_name) or find_chat_window_fuzzy(room_name)
+    if existing:
+        return {"success": True, "message": f"Already open: '{win32gui.GetWindowText(existing)}'",
+                "hwnd": existing, "title": win32gui.GetWindowText(existing), "opened_here": False}
+
+    main_hwnd = win32gui.FindWindow(config.KAKAO_MAIN_WINDOW_CLASS, config.KAKAO_MAIN_WINDOW_TITLE)
     if main_hwnd == 0:
         return {"success": False, "error": "KakaoTalk main window not found"}
 
-    # Ensure KakaoTalk is in the foreground before sending keyboard events
-    if not _ensure_foreground(main_hwnd):
-        _log("Warning: Could not bring KakaoTalk to foreground")
-
-    # Ctrl+F activates the search bar (Edit becomes visible and focused)
-    edit_hwnd = _activate_search_and_get_edit(main_hwnd)
-    if edit_hwnd is None:
-        return {"success": False, "error": "Search box not found in KakaoTalk main window"}
-
-    # Clear any existing text in the Edit using EM_SETSEL + WM_CLEAR
-    EM_SETSEL = 0x00B1
-    WM_CLEAR = 0x0303
-    win32api.SendMessage(edit_hwnd, EM_SETSEL, 0, -1)  # Select all
-    win32api.SendMessage(edit_hwnd, WM_CLEAR, 0, 0)     # Delete selected
-    time.sleep(config.EDIT_CLICK_WAIT_SEC)
-
-    # Type search text character by character using WM_CHAR
-    # This goes directly to the Edit control — no focus or clipboard needed
-    for ch in room_name:
-        win32api.SendMessage(edit_hwnd, config.WM_CHAR, ord(ch), 0)
-        time.sleep(config.SEARCH_CHAR_INTERVAL_SEC)
-    _log(f"Typed '{room_name}' into Edit via WM_CHAR")
-    time.sleep(config.SEARCH_RESULTS_WAIT_SEC)  # Wait for search results to populate
-
-    # Press Enter to open the first search result (already selected by default)
-    _log("Pressing Enter to open first search result")
-    _user32.keybd_event(config.VK_RETURN, 0, 0, 0)
-    _user32.keybd_event(config.VK_RETURN, 0, config.KEYEVENTF_KEYUP, 0)
-    time.sleep(config.SEARCH_OPEN_WAIT_SEC)
-
-    # Do NOT press Escape here — it would close the newly opened chat window
-
-    # Look for opened chat windows
-    all_windows = list_chat_windows()
-    _log(f"Open windows after search: {[w['title'] for w in all_windows]}")
-    for w in all_windows:
-        if w["title"] == room_name:
-            return {"success": True, "message": f"Opened chat room '{room_name}'", "hwnd": w["hwnd"]}
-    for w in all_windows:
-        if room_name in w["title"]:
-            return {
-                "success": True,
-                "message": f"Opened chat room '{w['title']}' (searched: '{room_name}')",
-                "hwnd": w["hwnd"],
-            }
-    if all_windows:
-        return {
-            "success": True,
-            "message": f"Opened a chat window (title: '{all_windows[0]['title']}')",
-            "hwnd": all_windows[0]["hwnd"],
-        }
-
-    return {
-        "success": False,
-        "error": f"Chat room '{room_name}' not found after search. "
-                 "The exact room name may differ from search results.",
-    }
-
+    prev_fg = get_foreground()
+    tried = []
+    try:
+        for q in _search_queries(room_name):
+            before = {w["hwnd"] for w in list_chat_windows()}
+            if not _ensure_foreground(main_hwnd):
+                return {"success": False, "error": "Could not focus KakaoTalk main window (aborted)", "tried": tried}
+            edit_hwnd = _activate_search_and_get_edit(main_hwnd)
+            if edit_hwnd is None:
+                return {"success": False, "error": "Search box not found in KakaoTalk main window", "tried": tried}
+            EM_SETSEL, WM_CLEAR = 0x00B1, 0x0303
+            win32api.SendMessage(edit_hwnd, EM_SETSEL, 0, -1)
+            win32api.SendMessage(edit_hwnd, WM_CLEAR, 0, 0)
+            time.sleep(config.EDIT_CLICK_WAIT_SEC)
+            # WM_CHAR with UTF-16 code units (surrogate pairs for emoji)
+            for unit in q.encode("utf-16-le").hex(" ", 2).split():
+                cu = int.from_bytes(bytes.fromhex(unit), "little")
+                win32api.SendMessage(edit_hwnd, config.WM_CHAR, cu, 0)
+                time.sleep(config.SEARCH_CHAR_INTERVAL_SEC)
+            time.sleep(config.SEARCH_RESULTS_WAIT_SEC)
+            # Safety: Enter only if the main window (search) has focus
+            if _user32.GetForegroundWindow() != main_hwnd:
+                return {"success": False, "error": "Focus left KakaoTalk main window; aborted before Enter", "tried": tried}
+            _user32.keybd_event(config.VK_RETURN, 0, 0, 0)
+            _user32.keybd_event(config.VK_RETURN, 0, config.KEYEVENTF_KEYUP, 0)
+            new = []
+            for _ in range(10):
+                time.sleep(0.15)
+                new = [w for w in list_chat_windows() if w["hwnd"] not in before]
+                if new:
+                    break
+            tried.append({"query": q, "opened": [w["title"] for w in new]})
+            match = next((w for w in new if _titles_match(room_name, w["title"])), None)
+            for w in new:
+                if match is None or w["hwnd"] != match["hwnd"]:
+                    close_chat_window(w["hwnd"])  # wrong room opened by us
+            if match:
+                return {"success": True, "message": f"Opened chat room '{match['title']}'",
+                        "hwnd": match["hwnd"], "title": match["title"], "opened_here": True, "tried": tried}
+        return {"success": False, "error": f"Chat room '{room_name}' not found (no opened window matched)", "tried": tried}
+    finally:
+        # clear the search box text so the list returns to normal
+        try:
+            e = find_child_window_recursive(_find_chat_list_view(main_hwnd), "Edit")
+            if e:
+                win32api.SendMessage(e, 0x000C, 0, "")
+        except Exception:
+            pass
+        if restore_focus:
+            restore_foreground(prev_fg)
 
 def _find_visible_search_list(main_hwnd: int) -> Optional[int]:
     """Find the visible SearchListCtrl in the main window."""
@@ -923,6 +1089,7 @@ def send_mention_message(room_name: str, mention_name: str, message: str) -> Dic
     Returns:
         Dict with success (bool) and message or error.
     """
+    _require_send_allowed()
     hwnd = find_chat_window(room_name)
     if hwnd is None:
         return {"success": False, "error": f"Chat window '{room_name}' not found"}
