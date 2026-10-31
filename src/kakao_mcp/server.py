@@ -72,7 +72,7 @@ def kakao_open_room(room_name: str) -> Dict:
         return {"error": f"Failed to open room '{room_name}': {e}"}
 
 
-@app.tool()
+# @app.tool()  # disabled: read-only
 def kakao_send_message(room_name: str, message: str) -> Dict:
     """Send a text message to a KakaoTalk chat room.
     The chat room window must already be open.
@@ -92,7 +92,7 @@ def kakao_send_message(room_name: str, message: str) -> Dict:
         return {"error": f"Failed to send message: {e}"}
 
 
-@app.tool()
+# @app.tool()  # disabled: read-only
 def kakao_send_bulk(room_names: list[str], message: str, interval_sec: float = 0.5) -> Dict:
     """Send the same message to multiple KakaoTalk chat rooms at once.
     Opens each room if not already open and sends the message sequentially.
@@ -116,7 +116,7 @@ def kakao_send_bulk(room_names: list[str], message: str, interval_sec: float = 0
         return {"error": f"Failed to send bulk messages: {e}"}
 
 
-@app.tool()
+# @app.tool()  # disabled: read-only
 def kakao_send_image(room_name: str, image_paths: list[str]) -> Dict:
     """Send image file(s) to a KakaoTalk chat room.
     Copies the image to clipboard using file-drop format and pastes into the chat.
@@ -200,7 +200,7 @@ def kakao_extract_links(room_name: str) -> Dict:
         return {"error": f"Failed to extract links: {e}"}
 
 
-@app.tool()
+# @app.tool()  # disabled: read-only
 def kakao_send_mention(room_name: str, mention_name: str, message: str) -> Dict:
     """Send a message with @mention to a KakaoTalk chat room.
     Types '@' to activate the mention popup, selects the target user,
