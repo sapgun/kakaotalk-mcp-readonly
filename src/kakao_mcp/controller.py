@@ -1285,3 +1285,79 @@ class ChatMonitor:
 
 # Module-level singleton
 _chat_monitor = ChatMonitor()
+
+# ---------------------------------------------------------------------------
+# Opt-in single message send (CLI only; MCP send tools stay disabled)
+# ---------------------------------------------------------------------------
+
+MAX_SEND_CHARS = 1000
+
+
+def send_single_message(room_name: str, text: str, confirm_room: str, dry_run: bool = False) -> Dict:
+    """Send exactly one text message to exactly one room, with safety checks.
+
+    Order: env guard -> confirm-room -> text checks -> open room (robust) ->
+    verify window title -> verify input box empty & focused -> paste + Enter.
+    dry_run stops right before anything is typed. Clipboard/focus restored.
+    """
+    _require_send_allowed()
+    if confirm_room != room_name:
+        return {"sent": False, "error": "--confirm-room does not match room exactly"}
+    if text is None or not text.strip():
+        return {"sent": False, "error": "Message text is empty"}
+    if len(text) > MAX_SEND_CHARS:
+        return {"sent": False, "error": f"Message too long ({len(text)} > {MAX_SEND_CHARS} chars)"}
+
+    prev_fg = get_foreground()
+    saved = save_clipboard()
+    try:
+        o = search_and_open_room(room_name, restore_focus=False)
+        if not o.get("success"):
+            return {"sent": False, "error": "open failed: " + str(o.get("error"))}
+        hwnd = o["hwnd"]
+        title = win32gui.GetWindowText(hwnd)
+        if _norm_title(title) != _norm_title(room_name):
+            return {"sent": False, "error": f"Window title mismatch: '{title}'"}
+        edit_hwnd = find_child_window_recursive(hwnd, config.KAKAO_EDIT_CLASS)
+        if edit_hwnd is None:
+            return {"sent": False, "error": "Input box not found", "title": title}
+        buf = ctypes.create_unicode_buffer(2048)
+        _user32.SendMessageW(edit_hwnd, 0x000D, 2048, buf)  # WM_GETTEXT
+        if buf.value.strip() not in ("", "\uba54\uc2dc\uc9c0 \uc785\ub825"):  # placeholder "메시지 입력"
+            return {"sent": False, "error": "Input box already has a draft; refusing", "title": title}
+        if not _ensure_foreground(hwnd):
+            return {"sent": False, "error": "Could not focus chat window", "title": title}
+        if win32gui.GetWindowText(_user32.GetForegroundWindow()) != title:
+            return {"sent": False, "error": "Foreground title changed; aborted", "title": title}
+        if dry_run:
+            return {"sent": False, "dry_run": True, "room": title, "chars": len(text),
+                    "checks": "env,confirm,length,open,title,empty-input,focus ok"}
+        try:
+            rect = win32gui.GetWindowRect(edit_hwnd)
+            _user32.SetCursorPos((rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2)
+            _user32.mouse_event(0x0002, 0, 0, 0, 0)
+            _user32.mouse_event(0x0004, 0, 0, 0, 0)
+            time.sleep(config.EDIT_CLICK_WAIT_SEC)
+        except Exception:
+            pass
+        if _user32.GetForegroundWindow() != hwnd:
+            return {"sent": False, "error": "Focus left chat window before paste; aborted", "title": title}
+        if not _open_clipboard():
+            return {"sent": False, "error": "Clipboard busy", "title": title}
+        try:
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
+        finally:
+            win32clipboard.CloseClipboard()
+        time.sleep(config.CLIPBOARD_PASTE_WAIT_SEC)
+        _send_ctrl_key_combo(0x56)
+        time.sleep(config.AFTER_PASTE_WAIT_SEC)
+        if _user32.GetForegroundWindow() != hwnd:
+            return {"sent": False, "error": "Focus left chat window before Enter; text left unsent in box", "title": title}
+        _user32.keybd_event(config.VK_RETURN, 0, 0, 0)
+        _user32.keybd_event(config.VK_RETURN, 0, config.KEYEVENTF_KEYUP, 0)
+        time.sleep(0.3)
+        return {"sent": True, "room": title, "chars": len(text)}
+    finally:
+        restore_clipboard(saved)
+        restore_foreground(prev_fg)
